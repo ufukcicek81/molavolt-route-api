@@ -1,7 +1,0 @@
-{
-  "name": "molavolt-route-api",
-  "version": "1.0.0",
-  "private": true,
-  "description": "MolaVolt rota üstü şarj durağı kontrol API",
-  "engines": { "node": ">=18" }
-}
