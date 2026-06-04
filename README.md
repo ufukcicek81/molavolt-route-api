@@ -1,25 +1,34 @@
-# MolaVolt Route API
+# MolaVolt Route API - OSRM Free
 
-Bu Vercel API, MolaVolt rota planlamasında şarj istasyonunun gerçekten gidiş istikametinde olup olmadığını kontrol eder.
+Bu paket Google Maps API istemez. Kredi kartı veya Google API key kullanmadan, ücretsiz OSRM public router ile rota kontrolü yapar.
 
-## Kurulum
-
-1. Bu klasörü ayrı bir GitHub reposuna yükleyin. Önerilen repo/proje adı: `molavolt-route-api`.
-2. Vercel'de **New Project** ile bu repoyu import edin.
-3. Vercel Project Settings > Environment Variables bölümüne şunu ekleyin:
+## Dosya yapısı
 
 ```text
-GOOGLE_MAPS_API_KEY=BURAYA_GOOGLE_MAPS_PLATFORM_KEY
+api/
+  health.js
+  route-check.js
+package.json
+README.md
 ```
 
-4. Google Cloud tarafında bu key için **Routes API** açık olmalı.
-5. Deploy sonrası test:
+## Vercel test
+
+Deploy sonrası sağlık kontrolü:
 
 ```text
-https://PROJE_ADI.vercel.app/api/health
+https://molavolt-route-api.vercel.app/api/health
 ```
 
-`googleKeyActive: true` görürsen Google Routes kontrolü aktif demektir.
+Beklenen cevap:
+
+```json
+{
+  "ok": true,
+  "provider": "osrm-free",
+  "googleKeyRequired": false
+}
+```
 
 ## Endpoint
 
@@ -27,16 +36,6 @@ https://PROJE_ADI.vercel.app/api/health
 POST /api/route-check
 ```
 
-Body örneği:
+API, `origin -> destination` ana rotası ile `origin -> station -> destination` ara durak rotasını karşılaştırır. Ara durak eklenince rota fazla uzuyorsa istasyonu eler.
 
-```json
-{
-  "origin": { "lat": 40.84, "lon": 31.15 },
-  "destination": { "lat": 39.93, "lon": 32.86 },
-  "candidates": [
-    { "id": "1", "name": "İstasyon", "lat": 40.1, "lon": 31.9, "routeProgress": 0.4, "routeDeviation": 0.5, "alongKm": 80 }
-  ]
-}
-```
-
-API, ana rota ile `origin -> istasyon -> hedef` rotasını karşılaştırır. İstasyon durak olarak eklenince rota gereksiz uzuyorsa veya geri dönüş yaptırıyorsa aday elenir.
+Not: OSRM ücretsizdir fakat Google kadar şerit/karşı yön hassasiyeti vermez. Bu yüzden toleranslar sıkı tutulmuştur.

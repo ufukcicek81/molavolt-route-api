@@ -1,7 +1,7 @@
 {
-  "name": "molavolt-route-api",
+  "name": "molavolt-route-api-osrm",
   "version": "1.0.0",
   "private": true,
-  "description": "MolaVolt rota üstü şarj durağı kontrol API",
+  "description": "MolaVolt ücretsiz OSRM rota üstü şarj durağı kontrol API",
   "engines": { "node": ">=18" }
 }
