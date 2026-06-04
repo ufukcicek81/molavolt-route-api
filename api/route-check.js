@@ -1,7 +1,6 @@
-// MolaVolt Route Check API
-// Vercel Serverless Function
-// Google Routes API varsa onu kullanır; yoksa OSRM fallback ile çalışır.
-// ENV: GOOGLE_MAPS_API_KEY=...
+// MolaVolt Route Check API - OSRM FREE VERSION
+// Google API key gerekmez. Ücretsiz OSRM public router ile ana rota ve ara durak rotasını karşılaştırır.
+// Version: UFUK_ROUTE_API_OSRM_FREE_0611
 
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -22,86 +21,20 @@ function validPoint(p) {
   return Number.isFinite(p.lat) && Number.isFinite(p.lon) && Math.abs(p.lat) <= 90 && Math.abs(p.lon) <= 180;
 }
 
-function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
 
 function havKm(a, b) {
   const R = 6371;
   const toRad = x => x * Math.PI / 180;
   const dLat = toRad(b.lat - a.lat);
   const dLon = toRad(b.lon - a.lon);
-  const x = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
 }
 
-function dynamicMaxExtraKm(baseKm, candidate) {
-  // Karşı şerit/servis yolu hatalarını yakalamak için kısa tutuyoruz.
-  // Büyük rotalarda bile gereksiz dönüşleri elemek için üst sınır 1.5 km.
-  const c = n(candidate?.routeDeviation, 0);
-  return clamp(Math.max(0.45, baseKm * 0.0025, c * 0.75), 0.45, 1.5);
-}
-
-async function googleComputeRoute({ origin, destination, intermediate, sideOfRoad = true }) {
-  const key = process.env.GOOGLE_MAPS_API_KEY;
-  if (!key) throw new Error('GOOGLE_MAPS_API_KEY yok');
-
-  const waypoint = (p, extra = {}) => ({
-    location: { latLng: { latitude: p.lat, longitude: p.lon } },
-    ...extra,
-  });
-
-  const body = {
-    origin: waypoint(origin),
-    destination: waypoint(destination),
-    travelMode: 'DRIVE',
-    routingPreference: 'TRAFFIC_UNAWARE',
-    computeAlternativeRoutes: false,
-    languageCode: 'tr-TR',
-    units: 'METRIC',
-  };
-
-  if (intermediate) {
-    body.intermediates = [waypoint(intermediate, sideOfRoad ? { vehicleStopover: true, sideOfRoad: true } : { vehicleStopover: true })];
-  }
-
-  const resp = await fetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Goog-Api-Key': key,
-      'X-Goog-FieldMask': 'routes.distanceMeters,routes.duration,routes.legs.distanceMeters,routes.legs.duration',
-    },
-    body: JSON.stringify(body),
-  });
-
-  const txt = await resp.text();
-  let data;
-  try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
-
-  if (!resp.ok) {
-    // sideOfRoad bazı noktalar için rota üretmezse basic waypoint ile bir kez daha denenebilir.
-    const msg = data?.error?.message || `Google Routes HTTP ${resp.status}`;
-    throw new Error(msg);
-  }
-
-  const route = data?.routes?.[0];
-  if (!route || !Number.isFinite(Number(route.distanceMeters))) throw new Error('Google rota boş');
-  const legs = Array.isArray(route.legs) ? route.legs : [];
-  return {
-    distanceKm: Number(route.distanceMeters) / 1000,
-    durationMin: parseDurationMin(route.duration),
-    legsKm: legs.map(l => Number(l.distanceMeters || 0) / 1000),
-  };
-}
-
-function parseDurationMin(s) {
-  if (!s) return 0;
-  const m = String(s).match(/([0-9.]+)s/);
-  return m ? Number(m[1]) / 60 : 0;
-}
-
-async function osrmRouteKm(points) {
+async function osrmRoute(points, overview = false) {
   const coords = points.map(p => `${p.lon},${p.lat}`).join(';');
-  const url = `https://router.project-osrm.org/route/v1/driving/${coords}?overview=false&alternatives=false&steps=false`;
+  const url = `https://router.project-osrm.org/route/v1/driving/${coords}?overview=${overview ? 'full' : 'false'}&geometries=geojson&alternatives=false&steps=false`;
   const r = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!r.ok) throw new Error(`OSRM HTTP ${r.status}`);
   const data = await r.json();
@@ -111,31 +44,33 @@ async function osrmRouteKm(points) {
     distanceKm: Number(route.distance || 0) / 1000,
     durationMin: Number(route.duration || 0) / 60,
     legsKm: (route.legs || []).map(l => Number(l.distance || 0) / 1000),
+    coordinates: route.geometry?.coordinates || []
   };
 }
 
-async function computeBase(origin, destination, provider) {
-  if (provider === 'google') return googleComputeRoute({ origin, destination });
-  return osrmRouteKm([origin, destination]);
+function routeScore(c) {
+  // Daha az ekstra yol, daha az sapma, daha ileri rota ve yüksek kW öncelikli.
+  return (n(c.routeProgress) * 120) - (n(c.extraKm) * 130) - (n(c.routeDeviation) * 35) + Math.min(25, n(c.routeKw) / 6);
 }
 
-async function computeVia(origin, station, destination, provider) {
-  if (provider === 'google') {
-    try {
-      return await googleComputeRoute({ origin, destination, intermediate: station, sideOfRoad: true });
-    } catch (e) {
-      // Nokta side-of-road ile erişilemiyorsa basic waypoint dene; yine uzarsa zaten elenecek.
-      return await googleComputeRoute({ origin, destination, intermediate: station, sideOfRoad: false });
-    }
-  }
-  return osrmRouteKm([origin, station, destination]);
+function dynamicMaxExtraKm(baseKm, cand) {
+  // Ücretsiz OSRM'de karşı şerit detayı yok, bu yüzden toleransı sıkı tutuyoruz.
+  // Kısa/orta rotada 0.8-2.2 km arası; çok uzun rotada en fazla 3 km.
+  const dev = n(cand?.routeDeviation, 0);
+  return clamp(Math.max(0.8, baseKm * 0.004, dev * 0.9), 0.8, 3.0);
+}
+
+function isProgressValid(cand) {
+  const p = n(cand.routeProgress, -1);
+  // Başlangıca çok yakın veya hedefe çok yakın noktaları durak diye zorlamayalım.
+  return p > 0.03 && p < 0.97;
 }
 
 module.exports = async function handler(req, res) {
   setCors(res);
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method === 'GET') {
-    return res.status(200).json({ ok: true, name: 'MolaVolt route-check', google: Boolean(process.env.GOOGLE_MAPS_API_KEY) });
+    return res.status(200).json({ ok: true, service: 'MolaVolt route-check', provider: 'osrm-free', googleKeyRequired: false, version: 'UFUK_ROUTE_API_OSRM_FREE_0611' });
   }
   if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Sadece POST desteklenir' });
 
@@ -143,25 +78,25 @@ module.exports = async function handler(req, res) {
     const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
     const origin = cleanPoint(body.origin);
     const destination = cleanPoint(body.destination);
-    const candidates = Array.isArray(body.candidates) ? body.candidates.slice(0, n(body.maxCandidates, 18)) : [];
+    const maxCandidates = clamp(n(body.maxCandidates, 18), 1, 35);
+    const candidates = Array.isArray(body.candidates) ? body.candidates.slice(0, maxCandidates) : [];
 
     if (!validPoint(origin) || !validPoint(destination)) {
       return res.status(400).json({ ok: false, error: 'origin/destination eksik veya hatalı' });
     }
     if (!candidates.length) {
-      return res.status(200).json({ ok: true, accepted: [], rejected: [], message: 'Aday istasyon yok' });
+      return res.status(200).json({ ok: true, provider: 'osrm-free', accepted: [], rejected: [], message: 'Aday istasyon yok' });
     }
 
-    let provider = process.env.GOOGLE_MAPS_API_KEY ? 'google' : 'osrm';
     let base;
     try {
-      base = await computeBase(origin, destination, provider);
+      base = await osrmRoute([origin, destination], false);
     } catch (e) {
-      provider = 'osrm';
-      base = await computeBase(origin, destination, provider);
+      // OSRM geçici yanıt vermezse düz mesafe yedeği. Adaylar yine çok sıkı elenir.
+      base = { distanceKm: havKm(origin, destination) * 1.18, durationMin: 0, legsKm: [] };
     }
 
-    const baseKm = base.distanceKm || havKm(origin, destination) * 1.18;
+    const baseKm = Math.max(1, n(base.distanceKm, havKm(origin, destination) * 1.18));
     const accepted = [];
     const rejected = [];
 
@@ -171,61 +106,72 @@ module.exports = async function handler(req, res) {
         rejected.push({ ...cand, ok: false, reason: 'koordinat hatalı' });
         continue;
       }
+      if (!isProgressValid(cand)) {
+        rejected.push({ ...cand, ok: false, reason: 'rota ilerlemesi uygunsuz' });
+        continue;
+      }
 
       try {
-        const via = await computeVia(origin, station, destination, provider);
-        const viaKm = via.distanceKm;
+        const via = await osrmRoute([origin, station, destination], false);
+        const viaKm = n(via.distanceKm);
         const extraKm = viaKm - baseKm;
-        const maxExtraKm = n(body.maxExtraKm, dynamicMaxExtraKm(baseKm, cand));
-        const legsKm = via.legsKm || [];
-        const leg1 = n(legsKm[0], 0);
-        const leg2 = n(legsKm[1], 0);
+        const legs = via.legsKm || [];
+        const leg1 = n(legs[0], 0);
+        const leg2 = n(legs[1], 0);
         const alongKm = n(cand.alongKm, baseKm * n(cand.routeProgress, 0));
+        const routeDeviation = n(cand.routeDeviation, 999);
+        const maxExtraKm = n(body.maxExtraKm, dynamicMaxExtraKm(baseKm, cand));
+        const maxBacktrackKm = Math.max(1.0, maxExtraKm + 0.75);
         const backtrackKm = leg1 - alongKm;
 
-        // Ana karar: Google/OSRM ile ara durak eklenince rota gereksiz uzuyorsa eliyoruz.
-        // Ek olarak ilk leg, ana rota üzerindeki beklenen ilerlemeden çok uzunsa ters yön/servis yolu şüphesi var.
-        const ok = extraKm >= -0.2 && extraKm <= maxExtraKm && backtrackKm <= Math.max(0.9, maxExtraKm + 0.6) && leg1 > 0 && leg2 > 0;
+        // Kabul kriteri:
+        // 1) Durak eklenince ana rota çok uzamayacak.
+        // 2) İlk bacak, ana rota üzerindeki beklenen ilerlemeden çok fazla uzun olmayacak.
+        // 3) Yol hattına sapma düşük kalacak.
+        // Bu kurallar ücretsiz OSRM ile ters dönüş/servis yolu riskini büyük ölçüde azaltır.
+        const ok =
+          extraKm >= -0.4 &&
+          extraKm <= maxExtraKm &&
+          backtrackKm <= maxBacktrackKm &&
+          routeDeviation <= n(body.maxRouteDeviationKm, 4.5) &&
+          leg1 > 0.05 &&
+          leg2 > 0.05;
+
         const result = {
           ...cand,
           ok,
-          provider,
+          provider: 'osrm-free',
           baseKm: Number(baseKm.toFixed(3)),
           viaKm: Number(viaKm.toFixed(3)),
           extraKm: Number(extraKm.toFixed(3)),
           maxExtraKm: Number(maxExtraKm.toFixed(3)),
           leg1Km: Number(leg1.toFixed(3)),
           leg2Km: Number(leg2.toFixed(3)),
+          alongKm: Number(alongKm.toFixed(3)),
           backtrackKm: Number(backtrackKm.toFixed(3)),
-          durationMin: Number((via.durationMin || 0).toFixed(1)),
-          reason: ok ? 'gidiş istikametinde kabul' : 'ters yön / karşı şerit / fazla sapma',
+          durationMin: Number(n(via.durationMin).toFixed(1)),
+          reason: ok ? 'OSRM ile rota üstü kabul' : 'fazla sapma / geri dönüş riski'
         };
         if (ok) accepted.push(result); else rejected.push(result);
       } catch (e) {
-        rejected.push({ ...cand, ok: false, provider, reason: 'rota kontrol edilemedi', error: String(e.message || e).slice(0, 180) });
+        rejected.push({ ...cand, ok: false, provider: 'osrm-free', reason: 'OSRM rota kontrol edemedi', error: String(e.message || e).slice(0, 180) });
       }
     }
 
-    accepted.sort((a, b) => {
-      const sa = (n(a.routeProgress) * 100) - (n(a.extraKm) * 80) - (n(a.routeDeviation) * 25) + Math.min(20, n(a.routeKw) / 8);
-      const sb = (n(b.routeProgress) * 100) - (n(b.extraKm) * 80) - (n(b.routeDeviation) * 25) + Math.min(20, n(b.routeKw) / 8);
-      return sb - sa;
-    });
+    accepted.sort((a, b) => routeScore(b) - routeScore(a));
 
     return res.status(200).json({
       ok: true,
-      provider,
+      provider: 'osrm-free',
+      version: 'UFUK_ROUTE_API_OSRM_FREE_0611',
+      googleKeyRequired: false,
       baseKm: Number(baseKm.toFixed(3)),
       checked: candidates.length,
       accepted,
-      rejected: rejected.slice(0, 50),
-      googleKeyActive: Boolean(process.env.GOOGLE_MAPS_API_KEY),
-      note: provider === 'google'
-        ? 'Google Routes ile gerçek durak ekleme kontrolü yapıldı.'
-        : 'GOOGLE_MAPS_API_KEY olmadığı için OSRM fallback kullanıldı; Google Haritalar dönüşlerini yakalamak için Google key ekleyin.',
+      rejected: rejected.slice(0, 80),
+      note: 'Google API kullanılmadı. Ücretsiz OSRM ile ana rota ve ara durak rotası karşılaştırıldı.'
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
+    return res.status(500).json({ ok: false, provider: 'osrm-free', error: String(e.message || e) });
   }
 };
-
